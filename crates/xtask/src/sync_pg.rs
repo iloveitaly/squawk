@@ -92,6 +92,19 @@ const IGNORED_LINES: &[&str] = &[
     "CREATE VIEW foo AS SELECT 1 INTO int4_tbl;",
     "INSERT INTO int4_tbl SELECT 1 INTO f;",
     "REPACK (CONCURRENTLY) :toast_rel;",
+    r#"SELECT E'wrong: \u061';"#,
+    r#"SELECT E'wrong: \U0061';"#,
+    r#"SELECT U&'wrong: \061';"#,
+    r#"SELECT U&'wrong: \+0061';"#,
+    r#"SELECT U&'wrong: \db99';"#,
+    r#"SELECT U&'wrong: \db99xy';"#,
+    r#"SELECT U&'wrong: \db99\0061';"#,
+    r#"SELECT U&'wrong: \+00db99\+000061';"#,
+    r#"SELECT U&'wrong: \+2FFFFF';"#,
+    r#"SELECT x'0 ';"#,
+    r#"SELECT x' 0';"#,
+    r#"SELECT b' 0';"#,
+    r#"SELECT b'0 ';"#,
 ];
 
 const VARIABLE_REPLACEMENTS: &[(&str, &str)] = &[
