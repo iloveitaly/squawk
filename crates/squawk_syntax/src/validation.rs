@@ -178,10 +178,140 @@ fn validate_literal(lit: ast::Literal, acc: &mut Vec<SyntaxError>) {
     }
 
     validate_unicode_esc_string(&lit, acc);
+    validate_prefixed_strings(&lit, acc);
+}
+
+#[derive(Clone, Copy)]
+enum PrefixedKind {
+    Bit,
+    Byte,
+    Esc,
+}
+
+fn validate_prefixed_strings(lit: &ast::Literal, acc: &mut Vec<SyntaxError>) {
+    let mut continuation: Option<PrefixedKind> = None;
+    for e in lit.syntax().children_with_tokens() {
+        let Some(token) = e.into_token() else {
+            continue;
+        };
+        match token.kind() {
+            ESC_STRING => {
+                let Some((inner, inner_start)) = prefixed_str_inner(&token, ['e', 'E']) else {
+                    continue;
+                };
+                validate_escape_string_content(inner, inner_start, acc);
+                continuation = Some(PrefixedKind::Esc);
+            }
+            BIT_STRING => {
+                let Some((inner, inner_start)) = prefixed_str_inner(&token, ['b', 'B']) else {
+                    continue;
+                };
+                validate_bit_string_content(inner, inner_start, acc);
+                continuation = Some(PrefixedKind::Bit);
+            }
+            BYTE_STRING => {
+                let Some((inner, inner_start)) = prefixed_str_inner(&token, ['x', 'X']) else {
+                    continue;
+                };
+                validate_byte_string_content(inner, inner_start, acc);
+                continuation = Some(PrefixedKind::Byte);
+            }
+            STRING => {
+                let Some(continuation) = continuation else {
+                    continue;
+                };
+                let Some(inner) = token
+                    .text()
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                else {
+                    continue;
+                };
+                let inner_start = token.text_range().start() + TextSize::new(1);
+                match continuation {
+                    PrefixedKind::Esc => validate_escape_string_content(inner, inner_start, acc),
+                    PrefixedKind::Bit => validate_bit_string_content(inner, inner_start, acc),
+                    PrefixedKind::Byte => validate_byte_string_content(inner, inner_start, acc),
+                };
+            }
+            WHITESPACE | COMMENT => (),
+            _ => continuation = None,
+        }
+    }
+}
+
+fn validate_bit_string_content(inner: &str, inner_start: TextSize, acc: &mut Vec<SyntaxError>) {
+    for (i, c) in inner.char_indices() {
+        if c != '0' && c != '1' {
+            acc.push(SyntaxError::new(
+                format!("\"{c}\" is not a valid binary digit"),
+                offset_range(inner_start, i..i + c.len_utf8()),
+            ));
+        }
+    }
+}
+
+fn validate_byte_string_content(inner: &str, inner_start: TextSize, acc: &mut Vec<SyntaxError>) {
+    for (i, c) in inner.char_indices() {
+        if !c.is_ascii_hexdigit() {
+            acc.push(SyntaxError::new(
+                format!("\"{c}\" is not a valid hexadecimal digit"),
+                offset_range(inner_start, i..i + c.len_utf8()),
+            ));
+        }
+    }
+}
+
+fn prefixed_str_inner(token: &SyntaxToken, prefix: [char; 2]) -> Option<(&str, TextSize)> {
+    let inner = token
+        .text()
+        .strip_prefix(prefix)
+        .and_then(|s| s.strip_prefix('\''))
+        .and_then(|s| s.strip_suffix('\''))?;
+    let inner_start = token.text_range().start() + TextSize::new(2);
+    Some((inner, inner_start))
+}
+
+fn validate_escape_string_content(inner: &str, inner_start: TextSize, acc: &mut Vec<SyntaxError>) {
+    let mut chars = inner.char_indices().peekable();
+    while let Some((esc_start, c)) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        let Some((next_pos, next_c)) = chars.next() else {
+            return;
+        };
+        let (required, example) = match next_c {
+            'u' => (4usize, r"\uXXXX"),
+            'U' => (8usize, r"\UXXXXXXXX"),
+            _ => continue,
+        };
+        let mut end = next_pos + next_c.len_utf8();
+        let mut got_all = true;
+        for _ in 0..required {
+            match chars.peek() {
+                Some(&(i, ch)) if ch.is_ascii_hexdigit() => {
+                    end = i + ch.len_utf8();
+                    chars.next();
+                }
+                _ => {
+                    got_all = false;
+                    break;
+                }
+            }
+        }
+        if !got_all {
+            acc.push(SyntaxError::new(
+                format!("Unicode escape requires {required} hex digits: {example}"),
+                offset_range(inner_start, esc_start..end),
+            ));
+        }
+    }
 }
 
 fn validate_unicode_esc_string(lit: &ast::Literal, acc: &mut Vec<SyntaxError>) {
     let mut unicode_esc = None;
+    let mut continuations: Vec<SyntaxToken> = vec![];
     let mut seen_uescape = false;
     let mut escape_char = '\\';
     for e in lit.syntax().children_with_tokens() {
@@ -204,36 +334,55 @@ fn validate_unicode_esc_string(lit: &ast::Literal, acc: &mut Vec<SyntaxError>) {
                 };
                 break;
             }
+            STRING if unicode_esc.is_some() => continuations.push(token),
             _ => (),
         }
     }
     let Some(token) = unicode_esc else {
         return;
     };
-    let text = token.text();
-    let Some(inside) = text
-        .strip_prefix("U&'")
-        .or_else(|| text.strip_prefix("u&'"))
+    let Some(inner) = token
+        .text()
+        .strip_prefix(['u', 'U'])
+        .and_then(|s| s.strip_prefix("&'"))
         .and_then(|s| s.strip_suffix('\''))
     else {
         return;
     };
-    let inside_start = token.text_range().start() + TextSize::new(3);
-    escape_unicode_esc_str(inside, escape_char, |range, result| {
+    let inner_start = token.text_range().start() + TextSize::new(3);
+    escape_unicode_esc_str(inner, escape_char, |range, result| {
         if let Err(err) = result {
             acc.push(SyntaxError::new(
                 err.to_string(),
-                offset_range(inside_start, range),
+                offset_range(inner_start, range),
             ));
         }
     });
+    for cont in continuations {
+        let Some(cont_inner) = cont
+            .text()
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+        else {
+            continue;
+        };
+        let cont_start = cont.text_range().start() + TextSize::new(1);
+        escape_unicode_esc_str(cont_inner, escape_char, |range, result| {
+            if let Err(err) = result {
+                acc.push(SyntaxError::new(
+                    err.to_string(),
+                    offset_range(cont_start, range),
+                ));
+            }
+        });
+    }
 }
 
 fn validate_unicode_esc_ident(token: &SyntaxToken, acc: &mut Vec<SyntaxError>) {
-    let text = token.text();
-    let Some(inside) = text
-        .strip_prefix("U&\"")
-        .or_else(|| text.strip_prefix("u&\""))
+    let Some(inner) = token
+        .text()
+        .strip_prefix(['u', 'U'])
+        .and_then(|s| s.strip_prefix("&\""))
         .and_then(|s| s.strip_suffix('"'))
     else {
         return;
@@ -266,12 +415,12 @@ fn validate_unicode_esc_ident(token: &SyntaxToken, acc: &mut Vec<SyntaxError>) {
         next = element.next_sibling_or_token();
     }
 
-    let inside_start = token.text_range().start() + TextSize::new(3);
-    escape_unicode_esc_str(inside, escape_char, |range, result| {
+    let inner_start = token.text_range().start() + TextSize::new(3);
+    escape_unicode_esc_str(inner, escape_char, |range, result| {
         if let Err(err) = result {
             acc.push(SyntaxError::new(
                 err.to_string(),
-                offset_range(inside_start, range),
+                offset_range(inner_start, range),
             ));
         }
     });
@@ -296,8 +445,7 @@ const fn is_valid_uescape_char(byte: u8) -> bool {
 }
 
 fn uescape_char(string_token: &SyntaxToken) -> Option<char> {
-    let text = string_token.text();
-    let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
+    let inner = string_token.text().strip_prefix('\'')?.strip_suffix('\'')?;
     let &[byte] = inner.as_bytes() else {
         return None;
     };
