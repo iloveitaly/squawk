@@ -105,6 +105,20 @@ fn update_versions(sh: &Shell, v: &str) -> Result<()> {
         r#""version": ".*""#,
         &json_rep,
     )?;
+    for target in [
+        "darwin-arm64",
+        "darwin-x64",
+        "linux-arm64",
+        "linux-x64",
+        "win32-x64",
+    ] {
+        replace_in_file(
+            sh,
+            &format!("npm/{target}/package.json"),
+            r#""version": ".*""#,
+            &json_rep,
+        )?;
+    }
 
     replace_in_file(
         sh,
